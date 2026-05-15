@@ -9,8 +9,17 @@
 name: Build & Tests
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   merge_group:
+  # Useful for manually testing changes to this workflow. Because we check for
+  # the merge queue by doing `github.event_name != 'pull_request'` rather than
+  # `github.event_name == 'merge_group'`, triggering via workflow dispatch has
+  # the effect of running all jobs, including those which would normally only be
+  # run in the merge queue.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -31,13 +40,21 @@ env:
 
 jobs:
   build_test:
-    runs-on: ubuntu-latest
-    # Generate and populate the global Cargo registry and cache first. Each
-    # job in the matrix runs in parallel, so without populating the cache
-    # first, most jobs would duplicate the work of downloading crates from
-    # the internet. Populating the cache first ensures that this work only
-    # happens once.
-    needs: generate_cache
+    # Default to `ubuntu-latest`, but when running Miri tests, use the beefier
+    # `ubuntu-24.04-64core`. Miri tests are very expensive and parallelizable.
+    # Note that Miri tests are only run in the merge queue.
+    runs-on: ${{ (matrix.crate == 'zerocopy' && matrix.toolchain == 'nightly' && github.event_name != 'pull_request') && 'ubuntu-24.04-64core' || 'ubuntu-latest' }}
+    # We pre-compute a Docker image containing most dependencies. Each job in
+    # the matrix runs in parallel, so without this pre-computation, most jobs
+    # would duplicate the work of downloading crates from the internet.
+    # Pre-computing ensures that this work only happens once.
+    needs: build_docker_env
+    permissions:
+      contents: read
+      packages: read # required to pull docker caches from ghcr.io
+    defaults:
+      run:
+        shell: /tmp/docker-shell.sh {0}
 
     strategy:
       # By default, this is set to `true`, which means that a single CI job
@@ -62,6 +79,7 @@ jobs:
           "no-zerocopy-generic-bounds-in-const-fn-1-61-0",
           "no-zerocopy-target-has-atomics-1-60-0",
           "no-zerocopy-aarch64-simd-1-59-0",
+          "no-zerocopy-aarch64-simd-be-1-87-0",
           "no-zerocopy-panic-in-const-and-vec-try-reserve-1-57-0"
         ]
         target: [
@@ -104,6 +122,8 @@ jobs:
             features: "--all-features"
           - toolchain: "no-zerocopy-aarch64-simd-1-59-0"
             features: "--all-features"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            features: "--all-features"
           - toolchain: "no-zerocopy-panic-in-const-and-vec-try-reserve-1-57-0"
             features: "--all-features"
           # Exclude any combination for the zerocopy-derive crate which
@@ -131,6 +151,8 @@ jobs:
           - crate: "zerocopy-derive"
             toolchain: "no-zerocopy-aarch64-simd-1-59-0"
           - crate: "zerocopy-derive"
+            toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+          - crate: "zerocopy-derive"
             toolchain: "no-zerocopy-panic-in-const-and-vec-try-reserve-1-57-0"
           # Exclude stable/wasm since wasm is no longer provided via rustup on
           # stable.
@@ -157,6 +179,28 @@ jobs:
           - toolchain: "no-zerocopy-aarch64-simd-1-59-0"
             target: "thumbv6m-none-eabi"
           - toolchain: "no-zerocopy-aarch64-simd-1-59-0"
+            target: "wasm32-unknown-unknown"
+          # Exclude non-aarch64 targets from the `no-zerocopy-aarch64-simd-be-1-87-0`
+          # toolchain.
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "i686-unknown-linux-gnu"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "x86_64-unknown-linux-gnu"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "arm-unknown-linux-gnueabi"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "powerpc-unknown-linux-gnu"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "powerpc64-unknown-linux-gnu"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "riscv64gc-unknown-linux-gnu"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "s390x-unknown-linux-gnu"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "x86_64-pc-windows-msvc"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
+            target: "thumbv6m-none-eabi"
+          - toolchain: "no-zerocopy-aarch64-simd-be-1-87-0"
             target: "wasm32-unknown-unknown"
           # Exclude most targets from the `no-zerocopy-core-error-1-81-0`
           # toolchain since the `no-zerocopy-core-error-1-81-0` feature is unrelated to
@@ -254,13 +298,68 @@ jobs:
     name: Build & Test (${{ matrix.crate }} / ${{ matrix.toolchain }} / ${{ matrix.features }} / ${{ matrix.target }})
 
     steps:
-    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       with:
         fetch-depth: 2
         persist-credentials: false
 
-    - name: Populate cache
-      uses: ./.github/actions/cache
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+    - name: Log in to the Container registry
+      uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Generate sanitized Docker tag
+      id: docker_tag
+      env:
+        REF_NAME: ${{ github.ref_name }}
+      shell: bash
+      run: |
+        echo "tag=${REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+    - name: Load image from cache
+      uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+      with:
+        context: .
+        file: .github/workflows/Dockerfile
+        load: true # This loads the resulting image into the local 'docker' daemon
+        tags: zerocopy-ci:local
+        provenance: false
+        cache-from: |
+          type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:${{ steps.docker_tag.outputs.tag }}
+          type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:main
+        # Notice we omit `cache-to` here. We don't want many parallel jobs
+        # fighting to write the exact same layers back to the cache API.
+
+    - name: Create Docker Shell Wrapper
+      shell: bash
+      run: |
+        set -eo pipefail
+
+        # Ensure the directories exist on the host so Docker doesn't create them as root
+        mkdir -p /home/runner/.cargo/registry /home/runner/.cargo/git
+
+        cat << 'EOF' > /tmp/docker-shell.sh
+        #!/bin/bash
+        # Boot an ephemeral container for the step, mounting the workspace and
+        # temp dirs. Explicitly forward GitHub Actions internal state and matrix
+        # environment variables.
+        docker run --rm -i \
+          --workdir "$PWD" \
+          -v /home/runner/work:/home/runner/work \
+          -v /home/runner/.cargo/registry:/root/.cargo/registry \
+          -v /home/runner/.cargo/git:/root/.cargo/git \
+          -e GITHUB_ENV -e GITHUB_PATH -e GITHUB_STEP_SUMMARY -e GITHUB_OUTPUT -e GITHUB_WORKSPACE \
+          -e CI -e GITHUB_ACTIONS -e GITHUB_ACTOR -e GITHUB_REPOSITORY -e GITHUB_SHA -e GITHUB_REF -e GITHUB_EVENT_NAME \
+          -e TOOLCHAIN -e CRATE -e TARGET -e FEATURES -e RUSTFLAGS -e MIRIFLAGS -e ZC_TOOLCHAIN \
+          -e ZC_SKIP_CARGO_SEMVER_CHECKS \
+          zerocopy-ci:local bash -c "git config --global --add safe.directory '*' && exec bash \"\$1\"" -- "$1"
+        EOF
+        chmod +x /tmp/docker-shell.sh
 
     - name: Configure environment variables
       env:
@@ -330,21 +429,6 @@ jobs:
         FEATURES: ${{ matrix.features }}
       run: ./cargo.sh +$TOOLCHAIN build --package $CRATE --target $TARGET $FEATURES --verbose
       if: matrix.target != 'thumbv6m-none-eabi'
-
-    # When building tests for the i686 target, we need certain libraries which
-    # are not installed by default; `gcc-multilib` includes these libraries.
-    - name: Install gcc-multilib
-      # Per [1]:
-      #
-      #   Note: Always run `sudo apt-get update` before installing a package. In
-      #   case the `apt` index is stale, this command fetches and re-indexes any
-      #   available packages, which helps prevent package installation failures.
-      #
-      # [1] https://docs.github.com/en/actions/using-github-hosted-runners/customizing-github-hosted-runners
-      run: |
-        sudo apt-get update
-        sudo apt-get install gcc-multilib
-      if: contains(matrix.target, 'i686')
 
     - name: Run tests
       env:
@@ -438,14 +522,6 @@ jobs:
         # Spawn twice the number of workers as there are CPU cores.
         THREADS=$(echo "$(nproc) * 2" | bc)
         echo "Running Miri tests with $THREADS threads" | tee -a $GITHUB_STEP_SUMMARY
-
-        # FIXME(https://github.com/nextest-rs/nextest/issues/2990): Once the fix
-        # [1] for this `cargo miri nextest` bug is published, either go back to
-        # installing the latest version of `cargo-nextest` or pin and set up a
-        # roller.
-        #
-        # [1] https://github.com/nextest-rs/nextest/pull/2991
-        ./cargo.sh +$TOOLCHAIN install --locked --version 0.9.122 cargo-nextest
 
         # Run under both the stacked borrows model (default) and under the tree 
         # borrows model to ensure we're compliant with both.
@@ -552,19 +628,21 @@ jobs:
     # in our vendor directory, and we don't vendor zerocopy. Removing this file
     # has the effect of causing the subsequent build to use crates.io rather
     # than vendored dependencies, which is fine since we only run this on the
-    # stable toolchain. Eventually, we should update this job to use the
-    # `--baseline-rev` option to use a previous git commit as the baseline for
-    # checking compatibility (rather than the most recent published version),
-    # which will make this unnecessary.
-    - name: Remove Cargo config
-      run: rm .cargo/config.toml
+    # stable toolchain. We also remove `tools/vendor` because it contains a
+    # vendored copy of zerocopy, which causes `cargo-semver-checks` to error
+    # with an ambiguous package error. Eventually, we should update this job to
+    # use the `--baseline-rev` option to use a previous git commit as the baseline
+    # for checking compatibility (rather than the most recent published version),
+    # which will make it unnecessary to remove `.cargo/config.toml`.
+    - name: Remove Cargo config and vendored dependencies
+      run: rm -rf .cargo/config.toml tools/vendor anneal/vendor
 
     # Check semver compatibility with the most recently-published version on
     # crates.io. We do this in the matrix rather than in its own job so that it
     # gets run on different targets. Some of our API is target-specific (e.g.,
     # SIMD type impls), and so we need to run on each target.
     - name: Check semver compatibility
-      uses: obi1kenobi/cargo-semver-checks-action@5b298c9520f7096a4683c0bd981a7ac5a7e249ae # v2.8
+      uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
       with:
         # Don't semver check zerocopy-derive; as a proc macro, it doesn't have
         # an API that cargo-semver-checks can understand.
@@ -593,13 +671,10 @@ jobs:
   codegen:
     runs-on: ubuntu-latest
     name: Run codegen tests
-    needs: generate_cache
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Run tests
         run: |
           set -eo pipefail
@@ -615,13 +690,10 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     name: Generate code coverage
-    needs: generate_cache
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Generate code coverage
         run: |
           set -eo pipefail
@@ -638,7 +710,7 @@ jobs:
             --skip ui \
             --skip codegen
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }} # zizmor: ignore[secrets-outside-env]
           files: lcov.info
@@ -647,7 +719,7 @@ jobs:
     runs-on: ubuntu-latest        
     name: 'Run tests under Kani'
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
@@ -676,13 +748,10 @@ jobs:
   check_be_aarch64:
     runs-on: ubuntu-latest
     name: Build (zerocopy / nightly / --simd / aarch64_be-unknown-linux-gnu)
-    needs: generate_cache
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Configure environment variables
         run: |
           set -eo pipefail
@@ -708,13 +777,10 @@ jobs:
   check_avr_atmega:
     runs-on: ubuntu-latest
     name: Build (zerocopy / nightly / --simd / avr-none)
-    needs: generate_cache
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Configure environment variables
         run: |
           set -eo pipefail
@@ -744,65 +810,50 @@ jobs:
   check_fmt:
     runs-on: ubuntu-latest
     name: Check Rust formatting
-    needs: generate_cache
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Check Rust formatting
         run: ./ci/check_fmt.sh
 
   check_stale_stderr:
     runs-on: ubuntu-latest
     name: Check stale stderr files
-    needs: generate_cache
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Check stale stderr
         run: ./ci/check_stale_stderr.sh
 
   check_actions:
-    needs: generate_cache
     runs-on: ubuntu-latest
     name: Check GitHub Actions
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Check Actions
         run: ./ci/check_actions.sh
 
   check_readme:
-    needs: generate_cache
     runs-on: ubuntu-latest
     name: Check README.md
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Check README.md
         run: ./ci/check_readme.sh
 
   check_versions:
-    needs: generate_cache
     runs-on: ubuntu-latest
     name: Check crate versions match
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       # Make sure that both crates are at the same version, and that zerocopy
       # depends exactly upon the current version of zerocopy-derive. See
       # `INTERNAL.md` for an explanation of why we do this.
@@ -810,60 +861,14 @@ jobs:
         run: ./ci/check_versions.sh
 
   check_msrv_is_minimal:
-    needs: generate_cache
     runs-on: ubuntu-latest
     name: Check MSRV is minimal
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
       - name: Check MSRV is minimal
         run: ./ci/check_msrv_is_minimal.sh
-
-  generate_cache:
-    runs-on: ubuntu-latest
-    name: Generate cache
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          persist-credentials: false
-      - name: Populate cache
-        uses: ./.github/actions/cache
-        with:
-          mode: generate
-          run: |
-            # Ensure all dependencies are downloaded - both for our crates and for
-            # tools we use in CI. We don't care about these tools succeeding for
-            # two reasons: First, this entire job is best-effort since it's just a
-            # performance optimization. Second, there may be failures due to
-            # issues other than failing to download dependencies (e.g., `cargo
-            # metadata` called with a malformed `Cargo.toml`, build failure in our
-            # own crate or in dependencies, etc). For those reasons, we discard
-            # stderr and ignore status codes.
-            #
-            # For downloading our crates' dependencies in particular, note that
-            # there is no support for doing this directly [1], so we just check
-            # all crates using --tests.
-            #
-            # We background all jobs and then wait for them so that they can run
-            # in parallel.
-            #
-            # [1]  https://stackoverflow.com/a/42139535/836390
-
-            cargo check --workspace --tests                         &> /dev/null &
-            # On our MSRV toolchain, updating the Cargo index takes a long time, so
-            # it is worth specifically caching the MSRV index.
-            ./cargo.sh +msrv check --workspace --tests              &> /dev/null &
-            cargo metadata                                          &> /dev/null &
-            cargo install cargo-readme --version 3.2.0              &> /dev/null &
-            cargo install --locked action-validator --version 0.8.0 &> /dev/null &
-            cargo install --locked kani-verifier                    &> /dev/null &
-            cargo install cargo-nextest                             &> /dev/null &
-            cargo kani setup                                        &> /dev/null &
-
-            wait
 
   check-all-toolchains-tested:
     runs-on: ubuntu-latest
@@ -873,7 +878,7 @@ jobs:
         # FIXME(https://github.com/mikefarah/yq/issues/2587): Remove
         # `GONOSUMDB` once this bug is fixed.
         run: GONOSUMDB=github.com/mikefarah/yq/v4 go install github.com/mikefarah/yq/v4@v4.44.1
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - name: Run check
@@ -887,7 +892,7 @@ jobs:
         # FIXME(https://github.com/mikefarah/yq/issues/2587): Remove
         # `GONOSUMDB` once this bug is fixed.
         run: GONOSUMDB=github.com/mikefarah/yq/v4 go install github.com/mikefarah/yq/v4@v4.44.1
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - name: Run dependency check
@@ -901,7 +906,7 @@ jobs:
         run: |
          sudo apt-get update
          sudo apt-get install ripgrep
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - name: Run todo check
@@ -911,7 +916,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Check auto-approvers setup
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - name: Structural Check
@@ -963,7 +968,7 @@ jobs:
         run: |
          sudo apt-get update
          sudo apt-get install ripgrep
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - name: Run dependency check
@@ -981,10 +986,10 @@ jobs:
     runs-on: ubuntu-latest
     name: zizmor
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: zizmorcore/zizmor-action@e639db99335bc9038abc0e066dfcd72e23d26fb4 # v0.3.0
+      - uses: zizmorcore/zizmor-action@71321a20a9ded102f6e9ce5718a2fcec2c4f70d8 # v0.5.2
         with:
           # Only scan the .github directory to avoid scanning vendored dependencies
           inputs: .github
@@ -995,9 +1000,52 @@ jobs:
           # the action only does if advanced-security is false.
           advanced-security: false
 
+  build_docker_env:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # required to push docker caches to ghcr.io
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate sanitized Docker tag
+        id: docker_tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          echo "tag=${REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and cache layers
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: .github/workflows/Dockerfile
+          push: false
+          provenance: false
+          cache-from: |
+            type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:${{ steps.docker_tag.outputs.tag }}
+            type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:main
+          cache-to: type=registry,ref=ghcr.io/google/zerocopy/zerocopy-ci-cache:${{ steps.docker_tag.outputs.tag }},mode=max
+
   # Used to signal to branch protections that all other jobs have succeeded.
   all-jobs-succeed:
-      name: All checks succeeded
+      # WARNING: This name is load-bearing! It's how GitHub's settings UI configures which jobs
+      # to block on. DO NOT change this name without updating the settings UI to match.
+      name: All checks succeeded (ci.yml)
       # On failure, we run and unconditionally exit with a failing status code.
       # On success, this job is skipped. Jobs skipped using `if:` are considered
       # to have succeeded:
@@ -1005,7 +1053,7 @@ jobs:
       # https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks#handling-skipped-but-required-checks
       if: failure()
       runs-on: ubuntu-latest
-      needs: [build_test, codegen, coverage, kani, check_be_aarch64, check_avr_atmega, check_fmt, check_actions, check_readme, check_versions, check_msrv_is_minimal, check_stale_stderr, generate_cache, check-all-toolchains-tested, check-job-dependencies, check-todo, run-git-hooks, check-auto-approvers, zizmor]
+      needs: [build_test, codegen, coverage, kani, check_be_aarch64, check_avr_atmega, check_fmt, check_actions, check_readme, check_versions, check_msrv_is_minimal, check_stale_stderr, check-all-toolchains-tested, check-job-dependencies, check-todo, run-git-hooks, check-auto-approvers, zizmor, build_docker_env]
       steps:
         - name: Mark the job as failed
           run: exit 1
